@@ -1,0 +1,22 @@
+# Python virtual environment
+venv/
+
+# Raw data - large files, and reproducible from the Olist Kaggle dataset
+data/*.csv
+
+# Spark/Delta generated output - reproducible by re-running the pipeline
+lakehouse/
+
+# Spark/Ivy caches
+.ivy2.5.2/
+metastore_db/
+spark-warehouse/
+derby.log
+
+# Python
+__pycache__/
+*.pyc
+
+# OS/editor clutter
+.DS_Store
+.vscode/
