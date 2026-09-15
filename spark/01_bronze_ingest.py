@@ -10,8 +10,8 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from delta import configure_spark_with_delta_pip
 
-DATA_DIR = "/home/komal/retailflow/data"
-BRONZE_DIR = "/home/komal/retailflow/lakehouse/bronze"
+DATA_DIR = "data"
+BRONZE_DIR = "lakehouse/bronze"
 
 # Maps output Delta table name -> source CSV filename
 SOURCE_FILES = {

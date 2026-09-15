@@ -11,9 +11,9 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from delta import configure_spark_with_delta_pip
 
-BRONZE_DIR = "/home/komal/retailflow/lakehouse/bronze"
-SILVER_DIR = "/home/komal/retailflow/lakehouse/silver"
-REJECTS_DIR = "/home/komal/retailflow/lakehouse/silver/_rejects"
+BRONZE_DIR = "lakehouse/bronze"
+SILVER_DIR = "lakehouse/silver"
+REJECTS_DIR = "lakehouse/silver/_rejects"
 
 
 def get_spark():

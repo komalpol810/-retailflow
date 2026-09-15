@@ -12,8 +12,8 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from delta import configure_spark_with_delta_pip
 
-SILVER_DIR = "/home/komal/retailflow/lakehouse/silver"
-GOLD_DIR = "/home/komal/retailflow/lakehouse/gold"
+SILVER_DIR = "lakehouse/silver"
+GOLD_DIR = "lakehouse/gold"
 
 
 def get_spark():
