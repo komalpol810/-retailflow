@@ -1,0 +1,239 @@
+{
+    "$schema": "http://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "factoryName": {
+            "type": "string",
+            "metadata": "Data Factory name",
+            "defaultValue": "etailflow-adf"
+        },
+        "ls_databricks_retailflow_properties_typeProperties_existingClusterId": {
+            "type": "string",
+            "defaultValue": "0928-181205-zyz1shia"
+        }
+    },
+    "variables": {
+        "factoryId": "[concat('Microsoft.DataFactory/factories/', parameters('factoryName'))]"
+    },
+    "resources": [
+        {
+            "name": "[concat(parameters('factoryName'), '/tr_daily_6am')]",
+            "type": "Microsoft.DataFactory/factories/triggers",
+            "apiVersion": "2018-06-01",
+            "properties": {
+                "annotations": [],
+                "runtimeState": "Stopped",
+                "pipelines": [
+                    {
+                        "pipelineReference": {
+                            "referenceName": "pl_retailflow_gold",
+                            "type": "PipelineReference"
+                        },
+                        "parameters": {}
+                    }
+                ],
+                "type": "ScheduleTrigger",
+                "typeProperties": {
+                    "recurrence": {
+                        "frequency": "Day",
+                        "interval": 1,
+                        "startTime": "2026-10-08T06:00:00",
+                        "timeZone": "India Standard Time",
+                        "schedule": {}
+                    }
+                }
+            },
+            "dependsOn": [
+                "[concat(variables('factoryId'), '/pipelines/pl_retailflow_gold')]"
+            ]
+        },
+        {
+            "name": "[concat(parameters('factoryName'), '/ls_databricks_retailflow')]",
+            "type": "Microsoft.DataFactory/factories/linkedServices",
+            "apiVersion": "2018-06-01",
+            "properties": {
+                "annotations": [],
+                "type": "AzureDatabricks",
+                "typeProperties": {
+                    "domain": "https://adb-7405607030600288.8.azuredatabricks.net",
+                    "authentication": "MSI",
+                    "workspaceResourceId": "/subscriptions/9f82d549-3534-4654-b4cf-9c7406b5d4a5/resourceGroups/retailflow-rg/providers/Microsoft.Databricks/workspaces/retailflow",
+                    "existingClusterId": "[parameters('ls_databricks_retailflow_properties_typeProperties_existingClusterId')]"
+                }
+            },
+            "dependsOn": []
+        },
+        {
+            "name": "[concat(parameters('factoryName'), '/pl_retailflow_gold')]",
+            "type": "Microsoft.DataFactory/factories/pipelines",
+            "apiVersion": "2018-06-01",
+            "properties": {
+                "activities": [
+                    {
+                        "name": "clean_bronze",
+                        "type": "DatabricksNotebook",
+                        "dependsOn": [],
+                        "policy": {
+                            "timeout": "0.12:00:00",
+                            "retry": 2,
+                            "retryIntervalInSeconds": 300,
+                            "secureOutput": false,
+                            "secureInput": false
+                        },
+                        "userProperties": [],
+                        "typeProperties": {
+                            "notebookPath": "/Users/komalpol2000@gmail.com/00_clean_bronze"
+                        },
+                        "linkedServiceName": {
+                            "referenceName": "ls_databricks_retailflow",
+                            "type": "LinkedServiceReference"
+                        }
+                    },
+                    {
+                        "name": "bronze_ingest",
+                        "type": "DatabricksNotebook",
+                        "dependsOn": [
+                            {
+                                "activity": "clean_bronze",
+                                "dependencyConditions": [
+                                    "Succeeded"
+                                ]
+                            }
+                        ],
+                        "policy": {
+                            "timeout": "0.12:00:00",
+                            "retry": 0,
+                            "retryIntervalInSeconds": 300,
+                            "secureOutput": false,
+                            "secureInput": false
+                        },
+                        "userProperties": [],
+                        "typeProperties": {
+                            "notebookPath": "/Users/komalpol2000@gmail.com/01_bronze_ingest"
+                        },
+                        "linkedServiceName": {
+                            "referenceName": "ls_databricks_retailflow",
+                            "type": "LinkedServiceReference"
+                        }
+                    },
+                    {
+                        "name": "silver_transform",
+                        "type": "DatabricksNotebook",
+                        "dependsOn": [
+                            {
+                                "activity": "bronze_ingest",
+                                "dependencyConditions": [
+                                    "Succeeded"
+                                ]
+                            }
+                        ],
+                        "policy": {
+                            "timeout": "0.12:00:00",
+                            "retry": 2,
+                            "retryIntervalInSeconds": 300,
+                            "secureOutput": false,
+                            "secureInput": false
+                        },
+                        "userProperties": [],
+                        "typeProperties": {
+                            "notebookPath": "/Users/komalpol2000@gmail.com/02_silver_transform"
+                        },
+                        "linkedServiceName": {
+                            "referenceName": "ls_databricks_retailflow",
+                            "type": "LinkedServiceReference"
+                        }
+                    },
+                    {
+                        "name": "gold_dimensions",
+                        "type": "DatabricksNotebook",
+                        "dependsOn": [
+                            {
+                                "activity": "silver_transform",
+                                "dependencyConditions": [
+                                    "Succeeded"
+                                ]
+                            }
+                        ],
+                        "policy": {
+                            "timeout": "0.12:00:00",
+                            "retry": 2,
+                            "retryIntervalInSeconds": 300,
+                            "secureOutput": false,
+                            "secureInput": false
+                        },
+                        "userProperties": [],
+                        "typeProperties": {
+                            "notebookPath": "/Users/komalpol2000@gmail.com/03_gold_dimensions.py"
+                        },
+                        "linkedServiceName": {
+                            "referenceName": "ls_databricks_retailflow",
+                            "type": "LinkedServiceReference"
+                        }
+                    },
+                    {
+                        "name": "gold_dim_customer_scd2",
+                        "type": "DatabricksNotebook",
+                        "dependsOn": [
+                            {
+                                "activity": "gold_dimensions",
+                                "dependencyConditions": [
+                                    "Succeeded"
+                                ]
+                            }
+                        ],
+                        "policy": {
+                            "timeout": "0.12:00:00",
+                            "retry": 2,
+                            "retryIntervalInSeconds": 300,
+                            "secureOutput": false,
+                            "secureInput": false
+                        },
+                        "userProperties": [],
+                        "typeProperties": {
+                            "notebookPath": "/Users/komalpol2000@gmail.com/04_gold_dim_customer_scd2"
+                        },
+                        "linkedServiceName": {
+                            "referenceName": "ls_databricks_retailflow",
+                            "type": "LinkedServiceReference"
+                        }
+                    },
+                    {
+                        "name": "gold_fct_order_items",
+                        "type": "DatabricksNotebook",
+                        "dependsOn": [
+                            {
+                                "activity": "gold_dim_customer_scd2",
+                                "dependencyConditions": [
+                                    "Succeeded"
+                                ]
+                            }
+                        ],
+                        "policy": {
+                            "timeout": "0.12:00:00",
+                            "retry": 2,
+                            "retryIntervalInSeconds": 300,
+                            "secureOutput": false,
+                            "secureInput": false
+                        },
+                        "userProperties": [],
+                        "typeProperties": {
+                            "notebookPath": "/Users/komalpol2000@gmail.com/05_gold_fct_order_items"
+                        },
+                        "linkedServiceName": {
+                            "referenceName": "ls_databricks_retailflow",
+                            "type": "LinkedServiceReference"
+                        }
+                    }
+                ],
+                "policy": {
+                    "elapsedTimeMetric": {}
+                },
+                "annotations": [],
+                "lastPublishTime": "2026-10-02T16:12:18Z"
+            },
+            "dependsOn": [
+                "[concat(variables('factoryId'), '/linkedServices/ls_databricks_retailflow')]"
+            ]
+        }
+    ]
+}
