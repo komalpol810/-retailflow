@@ -1,13 +1,11 @@
 # RetailFlow
 
-A data lakehouse and orchestration pipeline built on the Olist Brazilian
-e-commerce dataset, demonstrating a full modern data engineering stack: SQL
-dimensional modeling, a Spark-based medallion architecture, and
-production-style Airflow orchestration with retries and failure alerting.
+A data lakehouse and orchestration pipeline built on the Olist Brazilian e-commerce dataset. It demonstrates a full modern data engineering stack: SQL dimensional modeling, a Spark-based medallion architecture, production-style Airflow orchestration, and a cloud deployment on Azure (ADLS Gen2, Databricks, Data Factory, Synapse serverless SQL).
 
 ## Table of contents
 
 - [What this demonstrates](#what-this-demonstrates)
+- [What was run vs. what was studied](#what-was-run-vs-what-was-studied)
 - [Dataset](#dataset)
 - [Architecture](#architecture)
 - [Data model](#data-model)
@@ -18,156 +16,182 @@ production-style Airflow orchestration with retries and failure alerting.
 - [Setup](#setup)
 - [Running it](#running-it)
 - [Verifying correctness](#verifying-correctness)
-- [Monitoring & alerting](#monitoring--alerting)
-- [Design decisions & lessons learned](#design-decisions--lessons-learned)
+- [Monitoring and alerting](#monitoring-and-alerting)
+- [Cloud deployment (Azure)](#cloud-deployment-azure)
+- [Incremental processing with Delta Lake (Phase 6)](#incremental-processing-with-delta-lake-phase-6)
+- [Cost control](#cost-control)
+- [Design decisions and lessons learned](#design-decisions-and-lessons-learned)
 - [Troubleshooting](#troubleshooting)
 - [Future work](#future-work)
 
 ## What this demonstrates
 
 - Designing a dimensional (star schema) data model from a raw relational dataset
-- Building a medallion (Bronze → Silver → Gold) lakehouse with PySpark and Delta Lake
+- Building a medallion (Bronze, Silver, Gold) lakehouse with PySpark and Delta Lake
 - Implementing Slowly Changing Dimension (SCD Type 2) history tracking
-- Orchestrating a multi-stage pipeline with Apache Airflow: scheduling,
-  retry policies with backoff, and Slack-based failure alerting
-- Running the whole stack containerized with Docker, including a custom
-  Airflow image carrying project-specific dependencies
-- Debugging real cross-environment issues (hardcoded paths, network
-  instability during image pulls, orchestration-specific gotchas)
+- Orchestrating a multi-stage pipeline with Apache Airflow: scheduling, retries with backoff, and Slack failure alerting
+- Running the stack containerized with Docker, including a custom Airflow image
+- Migrating the lakehouse to Azure: ADLS Gen2 storage, Databricks transformations, Azure Data Factory scheduling, and Synapse serverless SQL views over Gold Delta files
+- Designing incremental processing (MERGE, SCD2 merge, Change Data Feed, OPTIMIZE/ZORDER/VACUUM) as a replacement for full refresh
+- Controlling cloud cost: budget alerts, terminated clusters, stopped triggers, and full teardown after the build
+- Debugging real cross-environment issues (hardcoded paths, network instability, credential and access-mode errors)
+
+## What was run vs. what was studied
+
+| Phase | Status |
+|---|---|
+| 1 to 4 (local build, Postgres, Spark medallion, Airflow) | Built and run locally |
+| 5 (Azure migration) | Built and run on Azure, verified against the local counts, then torn down |
+| 6 (incremental processing) | Designed and documented as Databricks PySpark; **not executed**, because the Databricks trial was used up |
+
+Phase 6 code is included as a reference implementation. No timings are claimed for it.
 
 ## Dataset
 
-[Olist Brazilian E-Commerce Public Dataset](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) —
-real, anonymized order data from a Brazilian marketplace, spanning
-customers, orders, order items, products, sellers, payments, reviews, and
-geolocation, across multiple raw CSV files.
+[Olist Brazilian E-Commerce Public Dataset](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce): real, anonymized order data from a Brazilian marketplace, spanning customers, orders, order items, products, sellers, payments, reviews, and geolocation, across multiple raw CSV files.
 
 ## Architecture
+
+### Local
 
 ```
 Raw CSVs (Olist dataset)
         |
         v
 +-------------------+
-|   Bronze layer     |  Raw ingestion, append-only, schema-on-read
+|   Bronze layer    |  Raw ingestion, append-only, schema-on-read
 +-------------------+
         |
         v
 +-------------------+
-|   Silver layer      |  Cleaned, validated, deduplicated, typed
+|   Silver layer    |  Cleaned, validated, deduplicated, typed
 +-------------------+
         |
         v
 +-------------------+
-|   Gold layer         |  Dimensional model: dim_customer (SCD2),
-|                       |  dim_product, dim_seller, dim_date,
-|                       |  fct_order_items
+|   Gold layer      |  dim_customer (SCD2), dim_product, dim_seller,
+|                   |  dim_date, fct_order_items
 +-------------------+
 ```
 
-Every run does a **full refresh**: Bronze is intentionally append-only, so
-each pipeline run starts by wiping `lakehouse/{bronze,silver,gold}` clean
-before re-ingesting from the raw CSVs. There's no incremental/CDC logic yet
-— see [Future work](#future-work).
+### Azure (Phase 5)
+
+```
+Raw CSVs --> ADLS Gen2 (bronze / silver / gold containers)
+                  |
+                  |  Databricks notebooks (PySpark + Delta)
+                  |  triggered daily by Azure Data Factory
+                  v
+            Gold Delta files in ADLS Gen2
+                  |
+                  v
+   Synapse serverless SQL: 7 views over the Gold Delta files
+   (no cluster running, no second copy of the data, pay per data scanned)
+```
+
+The local runs do a full refresh: Bronze is append-only, so each run wipes `lakehouse/{bronze,silver,gold}` and re-ingests. Phase 6 describes how to replace this with incremental logic.
 
 ## Data model
 
-The Gold layer implements a standard **star schema**:
+The local Gold layer is a star schema:
 
 | Table | Type | Notes |
 |---|---|---|
-| `dim_customer` | Dimension | **SCD Type 2** — tracks customer attribute history with effective-dated rows and a current-record flag |
+| `dim_customer` | Dimension | SCD Type 2: effective-dated rows and a current-record flag |
 | `dim_product` | Dimension | Product category, dimensions, etc. |
 | `dim_seller` | Dimension | Seller location and identifiers |
-| `dim_date` | Dimension | Standard date dimension for time-based analysis |
-| `fct_order_items` | Fact | Grain: one row per order item; foreign keys to all dimensions above, plus price/freight measures |
+| `dim_date` | Dimension | Standard date dimension |
+| `fct_order_items` | Fact | Grain: one row per order item; foreign keys to the dimensions, plus price and freight measures |
 
-Phase 2 (PostgreSQL) established this same star schema relationally first,
-before Phase 3 rebuilt it as a Spark-based lakehouse.
+The Azure Gold layer is exposed through 7 Synapse views, including a `dim_geography` dimension. The fact table's `customer_geography_key` joins to `dim_geography.geography_key` (a role-playing key, so the fact column name differs from the dimension's key name).
+
+Phase 2 built this schema relationally in PostgreSQL first; Phase 3 rebuilt it as a Spark lakehouse.
 
 ## Tech stack
 
 | Layer | Tool |
 |---|---|
 | Language | Python |
-| Distributed processing | PySpark 4.2.0 |
+| Distributed processing | PySpark 4.2.0 (local), Databricks (cloud) |
 | Table format | Delta Lake (delta-spark 4.4.0) |
 | Relational modeling | PostgreSQL 16 |
-| Orchestration | Apache Airflow 3.3.1 (CeleryExecutor) |
+| Orchestration (local) | Apache Airflow 3.3.1 (CeleryExecutor) |
+| Orchestration (cloud) | Azure Data Factory |
+| Cloud storage | Azure Data Lake Storage Gen2 |
+| Cloud SQL serving | Azure Synapse serverless SQL pool |
 | Alerting | Slack (Incoming Webhooks) |
 | Containerization | Docker / Docker Compose |
 | Runtime | OpenJDK 17, Ubuntu |
 
 ## Project phases
 
-- **Phase 1 — Foundations.** Initial exploration of the raw Olist dataset
-  and local environment setup.
-- **Phase 2 — Relational modeling.** Designed and built the star schema
-  above in PostgreSQL (`pg_dataeng`, via `docker-compose.yml` in this repo).
-- **Phase 3 — Lakehouse rebuild.** Rebuilt the same model as a PySpark
-  medallion architecture (Bronze → Silver → Gold), chained end-to-end via
-  `run_pipeline.py`. Verified against known-good row counts:
-  - `fct_order_items`: 112,650 rows
-  - `dim_customer` (SCD2): 96,355 total rows / 96,096 current / 252 changed customers
-  - Parquet-vs-CSV storage comparison explicitly scoped out.
-- **Phase 4 — Orchestration.** Rebuilt the pipeline as an Airflow DAG
-  (`retailflow_gold_pipeline`) in a separate Dockerized Airflow deployment,
-  using a custom image with the same PySpark/Delta/Java versions as the
-  core project. Added:
-  - A daily schedule (`0 6 * * *`, `catchup=False`)
-  - Retries with backoff (2 retries, 5-minute delay) for transient failures
-  - Slack alerting on task failure, via an Airflow Variable-stored webhook
-    (no secrets in code)
-- **Phase 5 — Cloud (in progress).** Migrating to Azure (ADLS Gen2 /
-  Databricks / ADF / Synapse).
+**Phase 1: Foundations.** Explored the raw Olist dataset and set up the local environment.
+
+**Phase 2: Relational modeling.** Designed and built the star schema in PostgreSQL (`pg_dataeng`, via `docker-compose.yml`).
+
+**Phase 3: Lakehouse rebuild.** Rebuilt the model as a PySpark medallion architecture, chained end to end by `run_pipeline.py`. Verified against known-good counts:
+- `fct_order_items`: 112,650 rows
+- `dim_customer` (SCD2): 96,355 total rows, 96,096 current, 252 changed customers
+
+**Phase 4: Orchestration.** Rebuilt the pipeline as an Airflow DAG (`retailflow_gold_pipeline`) in a separate Dockerized deployment with a custom image matching the core project's PySpark, Delta and Java versions. Added a daily schedule (`0 6 * * *`, `catchup=False`), retries with backoff (2 retries, 5-minute delay), and Slack alerting on failure through an Airflow Variable (no secrets in code).
+
+**Phase 5: Cloud migration (Azure).** Ported the pipeline to Azure. See [Cloud deployment](#cloud-deployment-azure).
+
+**Phase 6: Incremental processing.** Designed the move from full refresh to incremental Delta logic. See [Incremental processing](#incremental-processing-with-delta-lake-phase-6).
 
 ## Repository structure
 
 ```
-retailflow/                   # Core project (this repo)
-├── data/                     # Raw Olist CSVs
-├── spark/                    # PySpark ETL scripts
+retailflow/
+├── data/                        # Raw Olist CSVs (gitignored)
+├── spark/                       # Local PySpark ETL scripts
 │   ├── 01_bronze_ingest.py
 │   ├── 02_silver_transform.py
 │   ├── 03_gold_dimensions.py
 │   ├── 04_gold_dim_customer_scd2.py
 │   └── 05_gold_fct_order_items.py
-├── lakehouse/                 # Bronze / Silver / Gold Delta tables (generated, gitignored)
-├── run_pipeline.py            # Chains all 5 spark scripts end-to-end (host-run)
-├── docker-compose.yml         # Postgres (pg_dataeng) for Phase 2
-└── venv/                      # Python virtual environment
+├── databricks/
+│   └── notebooks/               # 00_clean_bronze and 01 to 05, exported as .py
+├── azure/
+│   ├── adf/                     # Data Factory pipeline and trigger JSON
+│   └── synapse/                 # Serverless SQL queries and view definitions
+├── docs/
+│   └── screenshots/             # Evidence from the Azure run
+├── lakehouse/                   # Generated Delta tables (gitignored)
+├── run_pipeline.py              # Chains the 5 local Spark scripts
+├── docker-compose.yml           # Postgres (pg_dataeng) for Phase 2
+├── requirements.txt
+└── venv/                        # Python virtual environment (gitignored)
 
-airflow-retailflow/            # Separate Airflow deployment (sibling directory,
-│                                deliberately kept apart from retailflow/'s own
-│                                docker-compose.yml to avoid conflating the two)
+airflow-retailflow/              # Separate Airflow deployment (sibling directory)
 ├── dags/
-│   └── retailflow_pipeline.py    # retailflow_gold_pipeline DAG definition
-├── Dockerfile                 # Extends apache/airflow:3.3.1 with Java 17 + PySpark + Delta
-└── docker-compose.yaml        # Airflow services (apiserver, scheduler,
-                                 # dag-processor, worker, triggerer, postgres,
-                                 # redis); mounts ~/retailflow into containers
-                                 # at /opt/retailflow
+│   └── retailflow_pipeline.py   # retailflow_gold_pipeline DAG
+├── Dockerfile                   # apache/airflow:3.3.1 + Java 17 + PySpark + Delta
+└── docker-compose.yaml          # Airflow services; mounts ~/retailflow at /opt/retailflow
 ```
 
 ## Prerequisites
 
-- Ubuntu (or another Linux distro) with Docker and Docker Compose installed
+- Ubuntu (or another Linux distro) with Docker and Docker Compose
 - Python 3.x with `venv`
-- ~4 GB+ free RAM for Spark + Airflow's Celery stack running concurrently
-- A Slack workspace (only needed for failure-alerting; optional otherwise)
+- About 4 GB of free RAM for Spark plus Airflow's Celery stack
+- A Slack workspace (optional, for failure alerts)
+- An Azure subscription (optional, only to reproduce Phase 5)
 
 ## Setup
 
-**1. Core project — Postgres + Python environment**
+**1. Core project: Postgres and Python environment**
+
 ```bash
 cd ~/retailflow
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt   # pyspark==4.2.0, delta-spark==4.4.0, psycopg2, etc.
-docker compose up -d              # starts Postgres (pg_dataeng)
+pip install -r requirements.txt
+docker compose up -d
 ```
 
 **2. Airflow deployment (separate folder, separate compose file)**
+
 ```bash
 mkdir -p ~/airflow-retailflow/{dags,logs,plugins,config}
 cd ~/airflow-retailflow
@@ -179,34 +203,33 @@ docker compose up airflow-init
 docker compose up -d
 ```
 
-UI available at `http://localhost:8080` (default login `airflow` / `airflow`
-unless changed).
+The UI is at http://localhost:8080 (default login `airflow` / `airflow` unless changed).
 
-**3. (Optional) Slack alerting**
-
-See [Monitoring & alerting](#monitoring--alerting) below.
+**3. Slack alerting (optional).** See [Monitoring and alerting](#monitoring-and-alerting).
 
 ## Running it
 
-**Core pipeline (host, manual run):**
+Core pipeline (host, manual run):
+
 ```bash
 cd ~/retailflow
 source venv/bin/activate
 python run_pipeline.py
 ```
 
-**Orchestrated (Airflow):**
+Orchestrated with Airflow:
+
 ```bash
 cd ~/airflow-retailflow
 docker compose up -d
-# DAG retailflow_gold_pipeline runs daily at 6 AM automatically, or trigger manually:
+# DAG retailflow_gold_pipeline runs daily at 6 AM, or trigger it manually:
 docker exec -it airflow-retailflow-airflow-apiserver-1 \
   airflow dags trigger retailflow_gold_pipeline
 ```
 
 ## Verifying correctness
 
-After a run, row counts in the Gold layer should match:
+After a run, the Gold layer should match:
 
 | Table | Expected count |
 |---|---|
@@ -215,90 +238,94 @@ After a run, row counts in the Gold layer should match:
 | `dim_customer` (current rows only) | 96,096 |
 | `dim_customer` (changed customers) | 252 |
 
-## Monitoring & alerting
+On Azure, all 7 Synapse view row counts were checked against the Databricks counts and matched exactly. A revenue-by-state query (`azure/synapse/revenue_by_state.sql`) ranked SP first with 47,433 items sold, followed by RJ, MG, RS and PR.
 
-The Airflow DAG posts a Slack message whenever a task fails (after retries
-are exhausted, not on every individual attempt):
+## Monitoring and alerting
 
-1. Create a Slack app at [api.slack.com/apps](https://api.slack.com/apps) →
-   enable **Incoming Webhooks** → add a webhook to your chosen channel.
-2. Store the webhook URL as an Airflow Variable (never hardcoded in the DAG):
+The Airflow DAG posts a Slack message when a task fails after its retries are exhausted:
+
+1. Create a Slack app at api.slack.com/apps, enable Incoming Webhooks, and add a webhook to a channel.
+2. Store the webhook URL as an Airflow Variable (never hardcoded):
    ```bash
    docker exec -it airflow-retailflow-airflow-apiserver-1 \
      airflow variables set slack_webhook_url "https://hooks.slack.com/services/..."
    ```
-3. The DAG's `on_failure_callback` reads this Variable and posts a message
-   with the DAG name, failed task name, run timestamp, and a direct link to
-   that task's logs.
+3. The DAG's `on_failure_callback` reads the Variable and posts the DAG name, failed task, run timestamp and a link to the task logs.
 
-Retry policy: 2 retries, 5-minute delay, before a task is considered truly
-failed and the Slack callback fires.
+Retry policy: 2 retries with a 5-minute delay before the callback fires.
 
-## Design decisions & lessons learned
+## Cloud deployment (Azure)
 
-- **Relative paths over absolute paths.** ETL scripts originally hardcoded
-  absolute host paths (`/home/.../retailflow/data`), which broke once the
-  project was mounted into a container at a different path (`/opt/retailflow`).
-  Fixed by switching all path constants to relative paths, since both the
-  host runner and the Airflow container `cd` into the project root before
-  running each script — a genuine portability fix, not just an
-  Airflow-specific workaround.
-- **Secrets in Airflow Variables, not code.** The Slack webhook URL is
-  stored as an Airflow Variable and read at runtime via `Variable.get()`,
-  never hardcoded in the DAG file.
-- **Retry-then-alert, not alert-on-every-attempt.** `on_failure_callback`
-  only fires after all retries are exhausted, so a single transient blip
-  doesn't trigger a false alarm — only a genuinely failed task does.
-- **Full refresh, not incremental (for now).** Given Bronze is append-only
-  by design, each run wipes and rebuilds the lakehouse from scratch.
-  Simpler to reason about and verify correctness against known row counts,
-  at the cost of reprocessing everything each run.
-- **Separate Airflow deployment, separate compose file.** Kept
-  `~/airflow-retailflow/` deliberately apart from `~/retailflow/`'s own
-  `docker-compose.yml` (Postgres) to avoid the two `docker compose` files
-  being conflated — running commands from the wrong directory silently
-  grabs the wrong compose file and produces confusing "service not running"
-  errors.
+Phase 5 moved the pipeline to Azure.
+
+| Component | Role |
+|---|---|
+| ADLS Gen2 | Storage for the Bronze, Silver and Gold layers |
+| Databricks | Runs the transformation notebooks (`00_clean_bronze`, `01` to `05`) in PySpark with Delta |
+| Azure Data Factory | Runs the pipeline on a daily 6 AM trigger (`tr_daily_6am`) |
+| Synapse serverless SQL | Serves the Gold Delta files as 7 SQL views |
+| Databricks secret scope | Holds the storage account key, read through `dbutils.secrets.get(...)` so no key is in a notebook |
+
+**Why Synapse serverless.** Databricks transforms the data and storage holds the Gold files. Serverless SQL exposes them as views with no cluster running and no second copy of the data, billed per data scanned. A dedicated pool is provisioned and billed hourly, so it suits heavy, constant dashboard workloads instead.
+
+**Authentication.** The notebooks authenticate to storage with the account key from a secret scope. A production setup would use a service principal or managed identity with RBAC on the storage account instead.
+
+**Roadmap note.** Microsoft is steering new analytics projects toward Microsoft Fabric. This project used the Synapse and Databricks combination because it is still widely deployed.
+
+## Incremental processing with Delta Lake (Phase 6)
+
+> Design and reference code, not executed (see [What was run vs. what was studied](#what-was-run-vs-what-was-studied)).
+
+| Concept | What it does here |
+|---|---|
+| Delta internals | `_delta_log` records every commit; `DESCRIBE HISTORY` and `VERSION AS OF` give audit and time travel |
+| `MERGE INTO` | Upserts on the business key, replacing the full wipe and reload |
+| SCD Type 2 merge | A two-copy staging trick closes the old row and inserts the new one in one merge |
+| Change Data Feed | Downstream jobs read only the rows that changed |
+| Late-arriving data | Merging on the business key makes reloads idempotent |
+| `OPTIMIZE` / `ZORDER` / `VACUUM` | Fixes the small-file problem, enables data skipping, and removes old files (default 7-day retention) |
+
+To validate it, the plan is to time a full refresh against an incremental run on the same data and record both numbers. This has not been done, so no performance claim is made.
+
+## Cost control
+
+- Azure usage ran on a Pay-As-You-Go subscription, with a budget alert configured; spend stayed at roughly $20.
+- The Databricks cluster was terminated and the ADF trigger stopped after the build.
+- Code, notebooks, pipeline JSON and SQL were exported to this repository, then the Azure resource groups were deleted.
+- Phases 7 onward run locally at no cost.
+
+## Design decisions and lessons learned
+
+- **Relative paths over absolute paths.** Scripts hardcoded host paths, which broke once the project was mounted at `/opt/retailflow` in a container. All paths are now relative to the project root.
+- **Secrets stay out of code.** The Slack webhook lives in an Airflow Variable; the storage key lives in a Databricks secret scope; `.env` is gitignored and was never committed.
+- **Retry, then alert.** `on_failure_callback` fires only after retries are exhausted, so one transient blip does not raise a false alarm.
+- **Full refresh first, incremental second.** Full refresh is simple to verify against known counts; Phase 6 designs the incremental replacement.
+- **Separate Airflow deployment.** `~/airflow-retailflow/` is kept apart from `~/retailflow/docker-compose.yml` to avoid running commands against the wrong compose file.
+- **Role-playing dimension key.** `customer_geography_key` in the fact table joins to `dim_geography.geography_key`; the first Synapse query failed on the wrong column name until this was corrected.
+- **Serverless over dedicated for serving.** Chosen for cost: nothing runs between queries.
+- **Tear down after building.** Cloud resources were deleted once evidence was captured, keeping the project at near-zero ongoing cost.
 
 ## Troubleshooting
 
-Real issues hit during development, kept here for reference:
+Real issues hit during development:
 
-- **Large Docker image pulls timing out on home WiFi.** Small HTTPS
-  requests worked fine, but the ~1.5 GB combined Airflow image pull
-  consistently timed out or reset mid-transfer. IPv6 and Docker daemon
-  config were ruled out; root cause was the home network choking on
-  sustained large transfers specifically. Fixed by switching to a mobile
-  hotspot for the initial image pull only — once cached locally, regular
-  WiFi is fine for everyday use.
-- **DAG appears "missing" after being added.** Airflow 3 DAGs start
-  **paused** by default and can get buried among ~100 built-in example
-  DAGs. Use the search box in the UI, or:
-  ```bash
-  docker exec -it airflow-retailflow-airflow-apiserver-1 \
-    airflow dags unpause retailflow_gold_pipeline
-  ```
-- **Task fails with a file-not-found error inside the container but works
-  on the host.** Almost always a hardcoded absolute path — check that
-  path constants are relative to the project root (see Design decisions
-  above).
-- **Slack alert doesn't show up right after a failure.**
-  `on_failure_callback` fires only once retries are exhausted — with
-  `retries=2` and a 5-minute delay, that can be ~10 minutes after the
-  first failed attempt. For faster testing, temporarily set `retries=0`.
-- **Looking for task/callback output and it's not in the per-task UI log.**
-  In Airflow 3's split-component `CeleryExecutor` setup, task execution and
-  callback output land in the **worker** container's own logs, not always
-  the per-task log file:
+- **Large Docker image pulls timing out on home WiFi.** Small HTTPS requests worked, but the roughly 1.5 GB Airflow image pull kept resetting. Switching to a mobile hotspot for the first pull fixed it; once cached, WiFi is fine.
+- **DAG appears "missing".** Airflow 3 DAGs start paused and can be buried among built-in examples. Search in the UI or run `airflow dags unpause retailflow_gold_pipeline` inside the apiserver container.
+- **File-not-found inside the container but fine on the host.** Almost always a hardcoded absolute path.
+- **Slack alert is slow to appear.** With `retries=2` and a 5-minute delay it can take about 10 minutes; set `retries=0` temporarily when testing.
+- **Callback output missing from the task log.** In Airflow 3's split-component setup it lands in the worker container logs:
   ```bash
   docker logs airflow-retailflow-airflow-worker-1 --since 15m | grep -i "slack\|callback"
   ```
+- **Databricks: single-user cluster check failed.** The cluster's assigned identity was a different user. Fixed by editing the cluster and setting Dedicated access to your own account.
+- **Databricks: `fs.azure.account.key` invalid.** The notebook was missing its storage login cell.
+- **Databricks: token endpoint "not found".** A service-principal template was filled with one secret reused for all three values. The project actually authenticates with the storage account key from the secret scope.
+- **Synapse: `Invalid column name 'geography_key'`.** The fact table column is `customer_geography_key`.
 
 ## Future work
 
-- Incremental/CDC ingestion instead of full refresh
-- Migrate storage and compute to Azure (ADLS Gen2, Databricks, ADF,
-  Synapse) — Phase 5
-- Data quality checks (e.g. Great Expectations) as an explicit pipeline
-  stage
-- CI checks (lint, DAG import-error check) on push
+- **Phase 7:** data quality checks (Great Expectations), unit tests (pytest), and CI with GitHub Actions
+- **Phase 8:** streaming ingestion (local)
+- **Phase 9:** dashboard, Spark tuning, and final documentation
+- Run the Phase 6 incremental logic and record measured full-refresh vs incremental timings
+- Evaluate Microsoft Fabric as the cloud target
