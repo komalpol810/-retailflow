@@ -13,7 +13,9 @@ import sys
 import time
 from pathlib import Path
 
-SPARK_DIR = Path(__file__).parent / "spark"
+PROJECT_ROOT = Path(__file__).parent
+SPARK_DIR = PROJECT_ROOT / "spark"
+LAKEHOUSE_LAYERS = ["bronze", "silver", "gold"]
 
 # Order matters: bronze must finish before silver reads it, etc.
 # Diagnostic/one-off scripts (00_smoke_test, 04a-04e) are excluded -
@@ -27,6 +29,25 @@ STAGES = [
 ]
 
 
+def check_lakehouse_is_clean() -> None:
+    """Bronze is append-only, so rerunning on top of existing data silently
+    multiplies row counts downstream. Refuse to run unless the layers are empty."""
+    dirty = []
+    for layer in LAKEHOUSE_LAYERS:
+        layer_dir = PROJECT_ROOT / "lakehouse" / layer
+        if layer_dir.exists() and any(layer_dir.iterdir()):
+            dirty.append(str(layer_dir.relative_to(PROJECT_ROOT)))
+
+    if dirty:
+        print("REFUSING TO RUN: these folders already contain data:")
+        for d in dirty:
+            print(f"  - {d}")
+        print("Bronze is append-only, so a rerun would duplicate rows.")
+        print("Wipe first, then run again:")
+        print("  rm -rf lakehouse/bronze lakehouse/silver lakehouse/gold")
+        sys.exit(1)
+
+
 def run_stage(label: str, script_name: str) -> None:
     script_path = SPARK_DIR / script_name
     print(f"\n{'=' * 60}")
@@ -36,7 +57,7 @@ def run_stage(label: str, script_name: str) -> None:
     start = time.time()
     result = subprocess.run(
         [sys.executable, str(script_path)],
-        cwd=Path(__file__).parent,  # run from project root, same as manual runs
+        cwd=PROJECT_ROOT,  # run from project root, same as manual runs
     )
     elapsed = time.time() - start
 
@@ -49,6 +70,8 @@ def run_stage(label: str, script_name: str) -> None:
 
 
 def main() -> None:
+    check_lakehouse_is_clean()
+
     pipeline_start = time.time()
     print(f"Starting RetailFlow pipeline: {len(STAGES)} stages")
 
