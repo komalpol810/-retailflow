@@ -1,6 +1,6 @@
 # RetailFlow
 
-A data lakehouse and orchestration pipeline built on the Olist Brazilian e-commerce dataset. It demonstrates a full modern data engineering stack: SQL dimensional modeling, a Spark-based medallion architecture, production-style Airflow orchestration, and a cloud deployment on Azure (ADLS Gen2, Databricks, Data Factory, Synapse serverless SQL).
+A data lakehouse and orchestration pipeline built on the Olist Brazilian e-commerce dataset. It demonstrates a full modern data engineering stack: SQL dimensional modeling, a Spark-based medallion architecture, production-style Airflow orchestration, a cloud deployment on Azure (ADLS Gen2, Databricks, Data Factory, Synapse serverless SQL), and incremental processing patterns with Delta Lake.
 
 ## Table of contents
 
@@ -32,9 +32,9 @@ A data lakehouse and orchestration pipeline built on the Olist Brazilian e-comme
 - Orchestrating a multi-stage pipeline with Apache Airflow: scheduling, retries with backoff, and Slack failure alerting
 - Running the stack containerized with Docker, including a custom Airflow image
 - Migrating the lakehouse to Azure: ADLS Gen2 storage, Databricks transformations, Azure Data Factory scheduling, and Synapse serverless SQL views over Gold Delta files
-- Designing incremental processing (MERGE, SCD2 merge, Change Data Feed, OPTIMIZE/ZORDER/VACUUM) as a replacement for full refresh
+- Implementing and testing incremental Delta Lake patterns: MERGE, a single-statement SCD2 merge, Change Data Feed, handling of late-arriving (out-of-order) dimension changes, and OPTIMIZE / ZORDER / VACUUM
 - Controlling cloud cost: budget alerts, terminated clusters, stopped triggers, and full teardown after the build
-- Debugging real cross-environment issues (hardcoded paths, network instability, credential and access-mode errors)
+- Debugging real cross-environment issues (hardcoded paths, network instability, credential and access-mode errors, SQL-on-path limits in Delta)
 
 ## What was run vs. what was studied
 
@@ -42,13 +42,13 @@ A data lakehouse and orchestration pipeline built on the Olist Brazilian e-comme
 |---|---|
 | 1 to 4 (local build, Postgres, Spark medallion, Airflow) | Built and run locally |
 | 5 (Azure migration) | Built and run on Azure, verified against the local counts, then torn down |
-| 6 (incremental processing) | Designed and documented as Databricks PySpark; **not executed**, because the Databricks trial was used up |
+| 6 (incremental processing) | Built and run locally with PySpark and Delta Lake, as standalone demo scripts. The Databricks trial was used up, so this phase did not run on Databricks. Not yet wired into `run_pipeline.py` or Airflow |
 
-Phase 6 code is included as a reference implementation. No timings are claimed for it.
+The Phase 6 results below are row counts, file counts and version histories from real runs. No timings are claimed: a measured full refresh vs incremental comparison has not been done.
 
 ## Dataset
 
-[Olist Brazilian E-Commerce Public Dataset](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce): real, anonymized order data from a Brazilian marketplace, spanning customers, orders, order items, products, sellers, payments, reviews, and geolocation, across multiple raw CSV files.
+Olist Brazilian E-Commerce Public Dataset: real, anonymized order data from a Brazilian marketplace, spanning customers, orders, order items, products, sellers, payments, reviews, and geolocation, across multiple raw CSV files.
 
 ## Architecture
 
@@ -89,7 +89,7 @@ Raw CSVs --> ADLS Gen2 (bronze / silver / gold containers)
    (no cluster running, no second copy of the data, pay per data scanned)
 ```
 
-The local runs do a full refresh: Bronze is append-only, so each run wipes `lakehouse/{bronze,silver,gold}` and re-ingests. Phase 6 describes how to replace this with incremental logic.
+The local pipeline runs do a full refresh: Bronze is append-only, so each run wipes `lakehouse/{bronze,silver,gold}` and re-ingests. Phase 6 demonstrates the incremental logic that could replace this.
 
 ## Data model
 
@@ -130,6 +130,7 @@ Phase 2 built this schema relationally in PostgreSQL first; Phase 3 rebuilt it a
 **Phase 2: Relational modeling.** Designed and built the star schema in PostgreSQL (`pg_dataeng`, via `docker-compose.yml`).
 
 **Phase 3: Lakehouse rebuild.** Rebuilt the model as a PySpark medallion architecture, chained end to end by `run_pipeline.py`. Verified against known-good counts:
+
 - `fct_order_items`: 112,650 rows
 - `dim_customer` (SCD2): 96,355 total rows, 96,096 current, 252 changed customers
 
@@ -137,19 +138,26 @@ Phase 2 built this schema relationally in PostgreSQL first; Phase 3 rebuilt it a
 
 **Phase 5: Cloud migration (Azure).** Ported the pipeline to Azure. See [Cloud deployment](#cloud-deployment-azure).
 
-**Phase 6: Incremental processing.** Designed the move from full refresh to incremental Delta logic. See [Incremental processing](#incremental-processing-with-delta-lake-phase-6).
+**Phase 6: Incremental processing.** Built and tested incremental Delta Lake patterns locally: MERGE, SCD2 merge, Change Data Feed, late-arriving data, and file maintenance (OPTIMIZE / ZORDER / VACUUM). See [Incremental processing](#incremental-processing-with-delta-lake-phase-6).
 
 ## Repository structure
 
 ```
 retailflow/
 ├── data/                        # Raw Olist CSVs (gitignored)
-├── spark/                       # Local PySpark ETL scripts
+├── spark/                       # Local PySpark ETL scripts and Phase 6 demos
 │   ├── 01_bronze_ingest.py
 │   ├── 02_silver_transform.py
 │   ├── 03_gold_dimensions.py
 │   ├── 04_gold_dim_customer_scd2.py
-│   └── 05_gold_fct_order_items.py
+│   ├── 05_gold_fct_order_items.py
+│   ├── 06_merge_demo.py                    # MERGE INTO, duplicate-key failure, de-duplication
+│   ├── 07_inspect_dim_customer.py          # Inspect dim_customer before the SCD2 merge
+│   ├── 07_scd2_merge_demo.py               # One-statement SCD2 merge, idempotent re-run
+│   ├── 08_change_data_feed_demo.py         # Change Data Feed
+│   ├── 09_late_arriving_demo.py            # Out-of-order SCD2 change: naive vs fixed logic
+│   ├── 10_optimize_zorder_vacuum_demo.py   # Small files, OPTIMIZE, ZORDER, VACUUM
+│   └── 10b_time_travel_after_vacuum.py     # Time travel after VACUUM
 ├── databricks/
 │   └── notebooks/               # 00_clean_bronze and 01 to 05, exported as .py
 ├── azure/
@@ -158,7 +166,8 @@ retailflow/
 ├── docs/
 │   └── screenshots/             # Evidence from the Azure run
 ├── lakehouse/                   # Generated Delta tables (gitignored)
-├── run_pipeline.py              # Chains the 5 local Spark scripts
+├── scratch/                     # Generated Delta tables for the Phase 6 demos
+├── run_pipeline.py              # Chains the 5 local Spark scripts (full refresh)
 ├── docker-compose.yml           # Postgres (pg_dataeng) for Phase 2
 ├── requirements.txt
 └── venv/                        # Python virtual environment (gitignored)
@@ -215,6 +224,14 @@ Core pipeline (host, manual run):
 cd ~/retailflow
 source venv/bin/activate
 python run_pipeline.py
+```
+
+`run_pipeline.py` includes a guard (`check_lakehouse_is_clean`) that checks the lakehouse is empty before ingesting. Bronze is append-only, so running the pipeline on top of existing data multiplies the rows.
+
+Phase 6 demos (each is a standalone script, run from the project root):
+
+```bash
+python spark/07_scd2_merge_demo.py
 ```
 
 Orchestrated with Airflow:
@@ -274,33 +291,56 @@ Phase 5 moved the pipeline to Azure.
 
 ## Incremental processing with Delta Lake (Phase 6)
 
-> Design and reference code, not executed (see [What was run vs. what was studied](#what-was-run-vs-what-was-studied)).
+Built and run locally with PySpark and delta-spark 4.4.0 after the Databricks trial credits ran out. The demos are standalone scripts in `spark/`; the production-style pipeline (`run_pipeline.py`) is still a full refresh.
 
-| Concept | What it does here |
-|---|---|
-| Delta internals | `_delta_log` records every commit; `DESCRIBE HISTORY` and `VERSION AS OF` give audit and time travel |
-| `MERGE INTO` | Upserts on the business key, replacing the full wipe and reload |
-| SCD Type 2 merge | A two-copy staging trick closes the old row and inserts the new one in one merge |
-| Change Data Feed | Downstream jobs read only the rows that changed |
-| Late-arriving data | Merging on the business key makes reloads idempotent |
-| `OPTIMIZE` / `ZORDER` / `VACUUM` | Fixes the small-file problem, enables data skipping, and removes old files (default 7-day retention) |
+| Milestone | What was built | Measured result |
+|---|---|---|
+| Delta internals | UPDATE, DELETE and RESTORE on the fact table, read back through the transaction log | Each operation created a new table version; row count went 112,650, then 112,267, then back to 112,650 after RESTORE |
+| MERGE INTO | Upsert on the business key (`06_merge_demo.py`) | A batch containing a duplicate key made the merge fail with nothing committed. After de-duplicating the batch, 2 rows were inserted and 3 updated (99,443 rows) |
+| SCD Type 2 merge | One atomic MERGE that closes the old row and inserts the new one (`07_scd2_merge_demo.py`) | Re-running the same batch changed nothing; every customer kept exactly one current row |
+| Change Data Feed | Row-level change records for downstream consumers (`08_change_data_feed_demo.py`) | 2 update preimages, 2 update postimages, 1 delete and 1 insert, as expected |
+| Late-arriving data | An older change arriving after a newer one (`09_late_arriving_demo.py`) | The naive logic produced an inverted date range; the fixed logic produced a clean history and was idempotent (details below) |
+| OPTIMIZE / ZORDER / VACUUM | Small-file compaction, data skipping and file cleanup (`10_...`, `10b_...`) | 100 files compacted to 34, then ZORDER to 24; a lookup opened 34 of 34 files before ZORDER and 1 of 24 after; VACUUM deleted 133 files (details below) |
 
-To validate it, the plan is to time a full refresh against an incremental run on the same data and record both numbers. This has not been done, so no performance claim is made.
+### How the SCD2 merge works
+
+Each customer who moved goes into the MERGE source twice. One copy carries the real customer key and matches the current row, which closes it (sets `valid_to` and `is_current = false`). The other copy carries a NULL key, which never matches, so it falls into the insert branch and becomes the new current row. Both actions happen in a single atomic commit. Idempotency comes from comparing a hash of the tracked columns (`row_hash`) against the current row: a batch that changes nothing produces no action.
+
+### Late-arriving data
+
+The first SCD2 logic assumed changes arrive in time order. The test picked a customer with two versions (Cajamar, then Sao Paulo from 2018-12-01) and sent a change dated 2018-08-20, older than the current version.
+
+- **Naive logic** (compare with the current row only): the late address became the current row, and the real current row was closed with a `valid_to` earlier than its own `valid_from`. A health check over the table reported 1 inverted date range and 2 rows not linked to the previous version.
+- **Fixed logic:** find the version that was valid at the change's date and split it in two. The first piece ends at the change date; the second starts there and inherits the old end date and current flag. Result: three rows, each ending where the next begins, with one current row. The health check reported 0 problems, and re-running the same batch did nothing.
+- **Known gap:** fact rows for orders placed after the late change date still point at the old dimension key. A real pipeline would need to re-point them.
+
+### File maintenance
+
+The demo table was written as 100 small files (112,650 rows). The maximum file size was lowered to 300 KB for the demo so that compaction produces more than one file.
+
+- **OPTIMIZE** compacted the table to 34 live files, but the parquet files on disk went up to 133, because the old files are kept for time travel.
+- **ZORDER BY customer_key** rewrote the table to 24 files. A lookup of one `customer_key` had to open 34 of 34 files before and 1 of 24 after (data skipping). Disk held 157 files.
+- **VACUUM** with a 0-hour retention (safety check disabled for the demo only; the default is 7 days) deleted 133 files, about 15 MB, leaving the 24 live files.
+- **Time travel after VACUUM:** reading version 0 failed, because its files were gone, while the current version read fine.
+- **Gotcha:** a plain `count()` on the vacuumed old version still succeeded, because Delta answers row counts from statistics in the transaction log without opening data files. The check that confirmed the failure reads actual column data.
 
 ## Cost control
 
 - Azure usage ran on a Pay-As-You-Go subscription, with a budget alert configured; spend stayed at roughly $20.
 - The Databricks cluster was terminated and the ADF trigger stopped after the build.
 - Code, notebooks, pipeline JSON and SQL were exported to this repository, then the Azure resource groups were deleted.
-- Phases 7 onward run locally at no cost.
+- Phase 6 onward runs locally at no cost.
 
 ## Design decisions and lessons learned
 
 - **Relative paths over absolute paths.** Scripts hardcoded host paths, which broke once the project was mounted at `/opt/retailflow` in a container. All paths are now relative to the project root.
 - **Secrets stay out of code.** The Slack webhook lives in an Airflow Variable; the storage key lives in a Databricks secret scope; `.env` is gitignored and was never committed.
 - **Retry, then alert.** `on_failure_callback` fires only after retries are exhausted, so one transient blip does not raise a false alarm.
-- **Full refresh first, incremental second.** Full refresh is simple to verify against known counts; Phase 6 designs the incremental replacement.
-- **Separate Airflow deployment.** `~/airflow-retailflow/` is kept apart from `~/retailflow/docker-compose.yml` to avoid running commands against the wrong compose file.
+- **Full refresh first, incremental second.** Full refresh is simple to verify against known counts, so it came first; Phase 6 builds and tests the incremental patterns separately.
+- **Guard against re-running on existing data.** Bronze is append-only, so a pipeline run on top of an existing lakehouse produced 1,789,384 fact rows instead of 112,650 and 4,784 missing geography keys instead of 302. `run_pipeline.py` now checks that the lakehouse is clean before it starts.
+- **De-duplicate before MERGE.** A source batch with two rows for the same key makes the merge fail, so the batch is reduced to one row per key first.
+- **Do not trust history logic that assumes ordered arrival.** The late-arriving test broke the first SCD2 implementation; the fix looks up the version valid at the change date instead of only the current row.
+- **Verify with a query that reads data.** A row count can be answered from Delta's log statistics, so it can look healthy while data files are missing.
 - **Role-playing dimension key.** `customer_geography_key` in the fact table joins to `dim_geography.geography_key`; the first Synapse query failed on the wrong column name until this was corrected.
 - **Serverless over dedicated for serving.** Chosen for cost: nothing runs between queries.
 - **Tear down after building.** Cloud resources were deleted once evidence was captured, keeping the project at near-zero ongoing cost.
@@ -321,11 +361,15 @@ Real issues hit during development:
 - **Databricks: `fs.azure.account.key` invalid.** The notebook was missing its storage login cell.
 - **Databricks: token endpoint "not found".** A service-principal template was filled with one secret reused for all three values. The project actually authenticates with the storage account key from the secret scope.
 - **Synapse: `Invalid column name 'geography_key'`.** The fact table column is `customer_geography_key`.
+- **Local: `lakehouse/gold` missing, then doubled row counts.** The first demo failed because the Gold folder did not exist. Rebuilding on top of old Bronze data multiplied the counts because Bronze is append-only; wiping `lakehouse/` and rebuilding restored 112,650 rows.
+- **Delta: SQL `UPDATE` or `ALTER TABLE` against a path fails.** Use the `DeltaTable` Python API for updates and deletes by path, and set the Change Data Feed through a session default (`spark.databricks.delta.properties.defaults.enableChangeDataFeed`) so new tables have it from version 0.
+- **Delta: MERGE fails with no rows committed.** The source batch contained a duplicate key; de-duplicate it first.
 
 ## Future work
 
-- **Phase 7:** data quality checks (Great Expectations), unit tests (pytest), and CI with GitHub Actions
-- **Phase 8:** streaming ingestion (local)
-- **Phase 9:** dashboard, Spark tuning, and final documentation
-- Run the Phase 6 incremental logic and record measured full-refresh vs incremental timings
+- Phase 7: data quality checks (Great Expectations), unit tests (pytest), and CI with GitHub Actions
+- Phase 8: streaming ingestion (local)
+- Phase 9: dashboard, Spark tuning, and final documentation
+- Wire the incremental logic into the pipeline and record measured full-refresh vs incremental timings
+- Re-point fact rows to the correct dimension key after a late-arriving SCD2 change
 - Evaluate Microsoft Fabric as the cloud target
