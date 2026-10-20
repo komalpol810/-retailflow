@@ -23,6 +23,7 @@ LAKEHOUSE_LAYERS = ["bronze", "silver", "gold"]
 STAGES = [
     ("Bronze", "01_bronze_ingest.py"),
     ("Silver", "02_silver_transform.py"),
+    ("Quality gate - Silver", "02b_silver_quality_gate.py"),
     ("Gold - Type-1 dimensions", "03_gold_dimensions.py"),
     ("Gold - dim_customer (SCD2)", "04_gold_dim_customer_scd2.py"),
     ("Gold - fct_order_items", "05_gold_fct_order_items.py"),
